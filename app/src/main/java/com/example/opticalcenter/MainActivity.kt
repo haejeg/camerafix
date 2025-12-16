@@ -3,49 +3,46 @@ package com.example.opticalcenter
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Rect
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
-import android.os.Build
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.opengl.GLES20
+import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.util.Log
-import android.view.ViewTreeObserver
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import kotlin.math.atan2
-import kotlin.math.asin
+import com.google.ar.core.ArCoreApk
+import com.google.ar.core.Config
+import com.google.ar.core.Coordinates2d
+import com.google.ar.core.Frame
+import com.google.ar.core.Pose
+import com.google.ar.core.Session
+import com.google.ar.core.TrackingState
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.opengles.GL10
+import kotlin.math.*
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,282 +57,198 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+data class SlamCalibrationInfo(
+    val opticalCx: Float, val opticalCy: Float,
+    val deltaX: Float, val deltaY: Float,
+    val totalAngularDifference: Float, // The factory error in degrees
+    val trackingState: String,
+    val pitchError: Float,
+    val rollError: Float
+)
+
 @Composable
 fun PermissionWrapper() {
     val context = LocalContext.current
     var hasPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        )
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
-
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = { isGranted -> hasPermission = isGranted }
     )
-
     LaunchedEffect(Unit) {
-        if (!hasPermission) {
-            launcher.launch(Manifest.permission.CAMERA)
-        }
+        if (!hasPermission) launcher.launch(Manifest.permission.CAMERA)
     }
-
-    if (hasPermission) {
-        CameraScreen()
-    } else {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier.fillMaxSize()
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    text = "Camera permission is required.",
-                    color = Color.White,
-                    textAlign = TextAlign.Center
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(onClick = { launcher.launch(Manifest.permission.CAMERA) }) {
-                    Text("Grant Permission")
-                }
-            }
-        }
-    }
+    if (hasPermission) SlamCameraScreen() else Box(Modifier.fillMaxSize())
 }
 
-// Update OpticalInfo to hold rotation data
-private data class OpticalInfo(
-    val screenCx: Float, val screenCy: Float,
-    val opticalCx: Float, val opticalCy: Float,
-    val deltaX: Float, val deltaY: Float,
-    // Rotation data (in degrees)
-    val pitch: Float, val roll: Float, val yaw: Float
-)
-
 @Composable
-private fun CameraScreen() {
+fun SlamCameraScreen() {
     val context = LocalContext.current
-    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    var slamInfo by remember { mutableStateOf<SlamCalibrationInfo?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    // UI States
-    var opticalInfo by remember { mutableStateOf<OpticalInfo?>(null) }
-    var statusMessage by remember { mutableStateOf("Initializing camera systems...") }
-    var isError by remember { mutableStateOf(false) }
-
-    val previewView = remember { PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
-
-    LaunchedEffect(Unit) {
-        runCatching {
-            statusMessage = "Discovering optical center..."
-            val result = discoverOpticalCenter(context)
-
-            statusMessage = "Binding CameraX preview..."
-            val cameraProvider = ProcessCameraProvider.getInstance(context).get()
-            cameraProvider.unbindAll()
-            val preview = Preview.Builder().build()
-            preview.setSurfaceProvider(previewView.surfaceProvider)
-
-            cameraProvider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview)
-
-            statusMessage = "Waiting for layout..."
-            previewView.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
-                override fun onGlobalLayout() {
-                    if (previewView.width > 0 && previewView.height > 0) {
-                        try {
-                            opticalInfo = result.computeOnPreview(previewView.width, previewView.height)
-                            // Clear status message on success
-                            statusMessage = ""
-                            previewView.viewTreeObserver.removeOnGlobalLayoutListener(this)
-                        } catch (e: Exception) {
-                            isError = true
-                            statusMessage = "Calculation Error: ${e.message}"
-                        }
-                    }
-                }
-            })
-        }.onFailure {
-            isError = true
-            statusMessage = "Error: ${it.message}\n${it.stackTrace.take(3).joinToString("\n")}"
-            Log.e("OpticalCenter", "Fatal Error", it)
+    val glSurfaceView = remember {
+        GLSurfaceView(context).apply {
+            setPreserveEGLContextOnPause(true)
+            setEGLContextClientVersion(2)
+            setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         }
     }
 
-    Box(
-        modifier = Modifier.fillMaxSize().background(Color.Black).safeDrawingPadding(),
-        contentAlignment = Alignment.Center
-    ) {
-        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+    DisposableEffect(Unit) {
+        var session: Session? = null
+        try {
+            if (ArCoreApk.getInstance().requestInstall(context as ComponentActivity, true) == ArCoreApk.InstallStatus.INSTALLED) {
+                session = Session(context)
+                val config = Config(session)
+                config.focusMode = Config.FocusMode.AUTO
+                config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                session.configure(config)
+                session.resume()
+            }
+        } catch (e: Exception) { errorMessage = e.message }
 
-        opticalInfo?.let { info ->
+        glSurfaceView.setRenderer(object : GLSurfaceView.Renderer {
+            override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+                GLES20.glClearColor(0f, 0f, 0f, 1f)
+                val textures = IntArray(1)
+                GLES20.glGenTextures(1, textures, 0)
+                session?.setCameraTextureName(textures[0])
+            }
+            override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+                GLES20.glViewport(0, 0, width, height)
+                session?.setDisplayGeometry(0, width, height)
+            }
+            override fun onDrawFrame(gl: GL10?) {
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+                val currentSession = session ?: return
+                try {
+                    val frame = currentSession.update()
+                    val camera = frame.camera
+
+                    // --- 1. OPTICAL CENTER ---
+                    val intrinsics = camera.imageIntrinsics
+                    val pp = intrinsics.principalPoint
+                    val coords = floatArrayOf(pp[0], pp[1])
+                    val outCoords = FloatArray(2)
+                    frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, coords, Coordinates2d.VIEW, outCoords)
+
+                    val opticalX = outCoords[0]
+                    val opticalY = outCoords[1]
+                    val screenCx = glSurfaceView.width / 2f
+                    val screenCy = glSurfaceView.height / 2f
+
+                    // --- 2. FACTORY TILT CALCULATION (The Real Stuff) ---
+                    // Calculate the PHYSICAL rotation from Device Center -> Camera Center
+                    // This subtracts the world movement, leaving only the static relationship.
+                    val devicePose = frame.androidSensorPose
+                    val cameraPose = camera.pose
+
+                    // Math: Offset = Device_Inverse * Camera
+                    val deviceToCamera = devicePose.inverse().compose(cameraPose)
+
+                    // Convert to Euler Angles (Degrees)
+                    val euler = quaternionToEuler(deviceToCamera)
+                    val yaw = euler[0]; val pitch = euler[1]; val roll = euler[2]
+
+                    // Compare to the "Ideal" Integers (Round to nearest 90)
+                    // This finds the deviation from the CAD file
+                    val idealPitch = (pitch / 90.0).roundToInt() * 90.0
+                    val idealRoll = (roll / 90.0).roundToInt() * 90.0
+                    val idealYaw = (yaw / 90.0).roundToInt() * 90.0
+
+                    val errPitch = abs(pitch - idealPitch).toFloat()
+                    val errRoll = abs(roll - idealRoll).toFloat()
+                    val errYaw = abs(yaw - idealYaw).toFloat()
+
+                    // Use the Max error or Root-Sum-Square as the "Total Score"
+                    // We ignore Yaw usually because it's just the sensor rotation (landscape/portrait)
+                    // But Pitch/Roll are the "Tilt"
+                    val totalError = sqrt((errPitch * errPitch) + (errRoll * errRoll))
+
+                    slamInfo = SlamCalibrationInfo(
+                        opticalCx = opticalX, opticalCy = opticalY,
+                        deltaX = opticalX - screenCx, deltaY = opticalY - screenCy,
+                        totalAngularDifference = totalError,
+                        trackingState = camera.trackingState.toString(),
+                        pitchError = errPitch,
+                        rollError = errRoll
+                    )
+
+                } catch (e: Exception) { }
+            }
+        })
+        onDispose { session?.pause(); session?.close() }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(factory = { glSurfaceView }, modifier = Modifier.fillMaxSize())
+
+        slamInfo?.let { info ->
             Canvas(modifier = Modifier.fillMaxSize()) {
-                // Red Cross (Screen Center)
-                drawLine(Color.Red, Offset(info.screenCx - 40, info.screenCy), Offset(info.screenCx + 40, info.screenCy), 5f)
-                drawLine(Color.Red, Offset(info.screenCx, info.screenCy - 40), Offset(info.screenCx, info.screenCy + 40), 5f)
-                // Green Cross (Optical Center)
+                val scx = size.width / 2
+                val scy = size.height / 2
+                // Screen Center (Red)
+                drawLine(Color.Red, Offset(scx - 40, scy), Offset(scx + 40, scy), 5f)
+                drawLine(Color.Red, Offset(scx, scy - 40), Offset(scx, scy + 40), 5f)
+                // Optical Center (Green)
                 drawLine(Color.Green, Offset(info.opticalCx - 40, info.opticalCy), Offset(info.opticalCx + 40, info.opticalCy), 5f)
                 drawLine(Color.Green, Offset(info.opticalCx, info.opticalCy - 40), Offset(info.opticalCx, info.opticalCy + 40), 5f)
             }
 
             Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .background(Color.Black.copy(alpha=0.6f))
-                    .padding(8.dp),
+                modifier = Modifier.align(Alignment.BottomCenter).background(Color.Black.copy(alpha = 0.7f)).padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                if(info.trackingState != TrackingState.TRACKING.toString()) {
+                    Text("INITIALIZING AR...", color = Color.Yellow)
+                }
+
+                Text("FACTORY CAMERA TILT", color = Color.Gray, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 Text(
-                    text = "Pos Delta: ${info.deltaX.toInt()} px, ${info.deltaY.toInt()} px",
-                    color = Color.White,
-                    fontSize = 16.sp
+                    text = "%.3f°".format(info.totalAngularDifference),
+                    color = if (info.totalAngularDifference > 0.5f) Color.Red else Color.Green,
+                    fontSize = 48.sp,
+                    fontWeight = FontWeight.Bold
                 )
-                Text(
-                    text = "Rot Delta: P:%.5f°, R:%.5f°, Y:%.5f°".format(info.pitch, info.roll, info.yaw),
-                    color = Color.Yellow,
-                    fontSize = 14.sp
-                )
+                Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+                    Text("Pitch Err: %.3f°".format(info.pitchError), color = Color.White, fontSize = 12.sp)
+                    Text("Roll Err: %.3f°".format(info.rollError), color = Color.White, fontSize = 12.sp)
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Optical Center Shift: ${info.deltaX.toInt()}, ${info.deltaY.toInt()} px", color = Color.LightGray, fontSize = 12.sp)
             }
         }
-
-        // Show Status/Error Message if not successful yet
-        if (opticalInfo == null) {
-            Text(
-                text = statusMessage,
-                color = if (isError) Color.Red else Color.Yellow,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.align(Alignment.Center).padding(16.dp).background(Color.Black.copy(alpha=0.7f))
-            )
-        }
     }
 }
 
-// ---------------- LOGIC ----------------
+// --- MATH HELPER ---
+// Converts Quaternion [x,y,z,w] to Euler Degrees [Yaw, Pitch, Roll]
+// --- MATH HELPER ---
+// Converts Quaternion [x,y,z,w] to Euler Degrees [Yaw, Pitch, Roll]
+fun quaternionToEuler(pose: Pose): FloatArray {
+    val q = pose.rotationQuaternion
+    val x = q[0]; val y = q[1]; val z = q[2]; val w = q[3]
 
-private data class DiscoveryResult(
-    val logicalCameraId: String, val physicalCameraId: String,
-    val activeArray: Rect, val cx: Float, val cy: Float, val sensorOrientation: Int,
-    val pitch: Float, val roll: Float, val yaw: Float // Added rotation fields
-) {
-    fun computeOnPreview(viewWidth: Int, viewHeight: Int): OpticalInfo {
-        val sensorW = activeArray.width().toFloat()
-        val sensorH = activeArray.height().toFloat()
-        val sensorAspect = sensorW / sensorH
-        val viewAspect = viewWidth.toFloat() / viewHeight.toFloat()
+    val sinr_cosp = 2 * (w * x + y * z)
+    val cosr_cosp = 1 - 2 * (x * x + y * y)
+    val roll = atan2(sinr_cosp, cosr_cosp)
 
-        val scale = if (viewAspect > sensorAspect) viewWidth / sensorW else viewHeight / sensorH
+    val sinp = 2 * (w * y - z * x)
+    // Ensure both branches return Double to avoid type inference issues
+    val pitch = if (abs(sinp) >= 1)
+        (PI / 2).withSign(sinp.toDouble())
+    else
+        asin(sinp).toDouble()
 
-        val (viewCx, viewCy) = if (sensorOrientation == 90 || sensorOrientation == 270) {
-            val rotatedCx = if (sensorOrientation == 90) cy else sensorH - cy
-            val rotatedCy = if (sensorOrientation == 90) sensorW - cx else cx
-            val scaledCx = rotatedCx * scale
-            val scaledCy = rotatedCy * scale
-            val centerX = viewWidth / 2f
-            val centerY = viewHeight / 2f
-            val drawnW = sensorH * scale
-            val drawnH = sensorW * scale
+    val siny_cosp = 2 * (w * z + x * y)
+    val cosy_cosp = 1 - 2 * (y * y + z * z)
+    val yaw = atan2(siny_cosp, cosy_cosp)
 
-            centerX + (scaledCx - drawnW / 2f) to centerY + (scaledCy - drawnH / 2f)
-        } else {
-            val scaledCx = cx * scale
-            val scaledCy = cy * scale
-            val centerX = viewWidth / 2f
-            val centerY = viewHeight / 2f
-            val drawnW = sensorW * scale
-            val drawnH = sensorH * scale
-
-            centerX + (scaledCx - drawnW / 2f) to centerY + (scaledCy - drawnH / 2f)
-        }
-
-        val screenCx = viewWidth / 2f
-        val screenCy = viewHeight / 2f
-
-        return OpticalInfo(
-            screenCx, screenCy, viewCx, viewCy, viewCx - screenCx, viewCy - screenCy,
-            pitch, roll, yaw // Pass rotation through
-        )
-    }
-}
-
-private fun discoverOpticalCenter(context: Context): DiscoveryResult {
-    val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-
-    // 1. Find Logical Back Camera
-    val logicalId = cameraManager.cameraIdList.firstOrNull { id ->
-        val chars = cameraManager.getCameraCharacteristics(id)
-        chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
-    } ?: error("No back camera found on device")
-
-    val logicalChars = cameraManager.getCameraCharacteristics(logicalId)
-
-    // 2. Get Physical IDs (Safe API Check)
-    val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-        logicalChars.physicalCameraIds ?: emptySet()
-    } else emptySet()
-
-    // 3. Determine which camera has intrinsics
-    val (chosenId, chosenChars) = if (logicalChars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION) != null) {
-        logicalId to logicalChars
-    } else {
-        val candidates = physicalIds.mapNotNull { pid ->
-            val c = cameraManager.getCameraCharacteristics(pid)
-            if (c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK) {
-                pid to c
-            } else null
-        }
-        val best = candidates.firstOrNull()
-        if (best != null) best else logicalId to logicalChars
-    }
-
-    // 4. Extract Calibration Data
-    val activeArray = chosenChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-        ?: error("Camera $chosenId has no Active Array Size")
-
-    val orientation = chosenChars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-    val intrinsics = chosenChars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
-
-    val cx: Float
-    val cy: Float
-
-    if (intrinsics != null) {
-        cx = intrinsics[2]
-        cy = intrinsics[3] // Correct index for cy
-    } else {
-        Log.w("OpticalCenter", "No intrinsics found for ID $chosenId. Using center fallback.")
-        cx = activeArray.width() / 2f
-        cy = activeArray.height() / 2f
-    }
-
-    // 5. EXTRACT ROTATION (POSE)
-    var pitch = 0f
-    var roll = 0f
-    var yaw = 0f
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-        val poseRotation = chosenChars.get(CameraCharacteristics.LENS_POSE_ROTATION)
-        if (poseRotation != null && poseRotation.size == 4) {
-            // Android gives Quaternion: [x, y, z, w]
-            val x = poseRotation[0]
-            val y = poseRotation[1]
-            val z = poseRotation[2]
-            val w = poseRotation[3]
-
-            // Convert Quaternion to Euler Angles (in degrees)
-            // Roll (x-axis rotation)
-            val sinr_cosp = 2 * (w * x + y * z)
-            val cosr_cosp = 1 - 2 * (x * x + y * y)
-            roll = Math.toDegrees(atan2(sinr_cosp.toDouble(), cosr_cosp.toDouble())).toFloat()
-
-            // Pitch (y-axis rotation)
-            val sinp = 2 * (w * y - z * x)
-            pitch = if (kotlin.math.abs(sinp) >= 1)
-                Math.toDegrees(kotlin.math.sign(sinp) * Math.PI / 2).toFloat()
-            else
-                Math.toDegrees(asin(sinp.toDouble())).toFloat()
-
-            // Yaw (z-axis rotation)
-            val siny_cosp = 2 * (w * z + x * y)
-            val cosy_cosp = 1 - 2 * (y * y + z * z)
-            yaw = Math.toDegrees(atan2(siny_cosp.toDouble(), cosy_cosp.toDouble())).toFloat()
-        }
-    }
-
-    return DiscoveryResult(logicalId, chosenId, activeArray, cx, cy, orientation, pitch, roll, yaw)
+    return floatArrayOf(
+        Math.toDegrees(yaw.toDouble()).toFloat(),    // Added .toDouble()
+        Math.toDegrees(pitch).toFloat(),             // pitch is already Double now
+        Math.toDegrees(roll.toDouble()).toFloat()    // Added .toDouble()
+    )
 }
